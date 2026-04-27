@@ -1058,6 +1058,86 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(llmCalls).toBe(1);
 	});
+
+	it("should send afterToolCall llmContent to the model while preserving tool result content", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return {
+					content: [{ type: "text", text: `full tool output: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: (messages) =>
+				messages
+					.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult")
+					.map((m) => {
+						if (m.role !== "toolResult" || m.llmContent === undefined) return m as Message;
+						const { llmContent, ...message } = m;
+						return { ...message, content: llmContent };
+					}),
+			afterToolCall: async () => ({
+				llmContent: [{ type: "text", text: "preview only" }],
+			}),
+		};
+
+		let callIndex = 0;
+		let secondCallToolResultText = "";
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, (_model, ctx) => {
+			if (callIndex === 1) {
+				const toolResult = ctx.messages.find((message) => message.role === "toolResult");
+				if (toolResult?.role === "toolResult") {
+					secondCallToolResultText = toolResult.content
+						.filter((item): item is { type: "text"; text: string } => item.type === "text")
+						.map((item) => item.text)
+						.join("\n");
+				}
+			}
+
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const message = createAssistantMessage(
+						[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					mockStream.push({ type: "done", reason: "stop", message });
+				}
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		const messages = await stream.result();
+		const toolResult = messages.find((message) => message.role === "toolResult");
+		expect(secondCallToolResultText).toBe("preview only");
+		expect(toolResult?.role).toBe("toolResult");
+		if (toolResult?.role === "toolResult") {
+			expect(toolResult.content).toEqual([{ type: "text", text: "full tool output: hello" }]);
+			expect(toolResult.llmContent).toEqual([{ type: "text", text: "preview only" }]);
+		}
+	});
 });
 
 describe("agentLoopContinue with AgentMessage", () => {

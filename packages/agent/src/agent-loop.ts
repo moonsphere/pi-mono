@@ -7,7 +7,9 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type ImageContent,
 	streamSimple,
+	type TextContent,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@mariozechner/pi-ai";
@@ -491,6 +493,7 @@ type ExecutedToolCallOutcome = {
 type FinalizedToolCallOutcome = {
 	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
+	llmContent?: (TextContent | ImageContent)[];
 	isError: boolean;
 };
 
@@ -633,7 +636,14 @@ async function finalizeExecutedToolCall(
 					details: afterResult.details ?? result.details,
 					terminate: afterResult.terminate ?? result.terminate,
 				};
+				const llmContent = afterResult.llmContent;
 				isError = afterResult.isError ?? isError;
+				return {
+					toolCall: prepared.toolCall,
+					result,
+					llmContent,
+					isError,
+				};
 			}
 		} catch (error) {
 			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
@@ -666,7 +676,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 }
 
 function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
-	return {
+	const message: ToolResultMessage = {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
 		toolName: finalized.toolCall.name,
@@ -675,6 +685,10 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		isError: finalized.isError,
 		timestamp: Date.now(),
 	};
+	if (finalized.llmContent !== undefined) {
+		message.llmContent = finalized.llmContent;
+	}
+	return message;
 }
 
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {

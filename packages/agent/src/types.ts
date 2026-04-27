@@ -53,7 +53,8 @@ export interface BeforeToolCallResult {
  * Partial override returned from `afterToolCall`.
  *
  * Merge semantics are field-by-field:
- * - `content`: if provided, replaces the tool result content array in full
+ * - `content`: if provided, replaces the display/session tool result content array in full
+ * - `llmContent`: if provided, replaces the model-visible tool result content array in full
  * - `details`: if provided, replaces the tool result details value in full
  * - `isError`: if provided, replaces the tool result error flag
  * - `terminate`: if provided, replaces the early-termination hint
@@ -63,6 +64,7 @@ export interface BeforeToolCallResult {
  */
 export interface AfterToolCallResult {
 	content?: (TextContent | ImageContent)[];
+	llmContent?: (TextContent | ImageContent)[];
 	details?: unknown;
 	isError?: boolean;
 	/**
@@ -109,6 +111,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage
 	 * that the LLM can understand. AgentMessages that cannot be converted (e.g., UI-only notifications,
 	 * status messages) should be filtered out.
+	 * If a ToolResultMessage has `llmContent`, use it as the returned `content` and do not pass the
+	 * non-provider `llmContent` field through to the LLM provider.
 	 *
 	 * Contract: must not throw or reject. Return a safe fallback value instead.
 	 * Throwing interrupts the low-level agent loop without producing a normal event sequence.
@@ -123,6 +127,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 *   if (m.role === "notification") {
 	 *     // Filter out UI-only messages
 	 *     return [];
+	 *   }
+	 *   if (m.role === "toolResult" && m.llmContent) {
+	 *     const { llmContent, ...message } = m;
+	 *     return [{ ...message, content: llmContent }];
 	 *   }
 	 *   // Pass through standard LLM messages
 	 *   return [m];
@@ -212,7 +220,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.
 	 *
 	 * Return an `AfterToolCallResult` to override parts of the executed tool result:
-	 * - `content` replaces the full content array
+	 * - `content` replaces the display/session content array
+	 * - `llmContent` replaces the model-visible content array
 	 * - `details` replaces the full details payload
 	 * - `isError` replaces the error flag
 	 * - `terminate` replaces the early-termination hint

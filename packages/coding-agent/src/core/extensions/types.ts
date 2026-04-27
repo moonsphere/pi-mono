@@ -834,6 +834,7 @@ interface ToolResultEventBase {
 	toolCallId: string;
 	input: Record<string, unknown>;
 	content: (TextContent | ImageContent)[];
+	llmContent?: (TextContent | ImageContent)[];
 	isError: boolean;
 }
 
@@ -997,6 +998,7 @@ export interface UserBashEventResult {
 
 export interface ToolResultEventResult {
 	content?: (TextContent | ImageContent)[];
+	llmContent?: (TextContent | ImageContent)[];
 	details?: unknown;
 	isError?: boolean;
 }

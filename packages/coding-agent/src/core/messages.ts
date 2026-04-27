@@ -183,8 +183,14 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					};
 				case "user":
 				case "assistant":
-				case "toolResult":
 					return m;
+				case "toolResult": {
+					const { llmContent, ...message } = m;
+					return {
+						...message,
+						content: llmContent ?? message.content,
+					};
+				}
 				default:
 					// biome-ignore lint/correctness/noSwitchDeclarations: fine
 					const _exhaustiveCheck: never = m;

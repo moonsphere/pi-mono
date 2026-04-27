@@ -25,9 +25,16 @@ import type {
 } from "./types.js";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	);
+	return messages.flatMap((message): Message[] => {
+		if (message.role === "user" || message.role === "assistant") {
+			return [message];
+		}
+		if (message.role === "toolResult") {
+			const { llmContent, ...toolResultMessage } = message;
+			return [{ ...toolResultMessage, content: llmContent ?? toolResultMessage.content }];
+		}
+		return [];
+	});
 }
 
 const EMPTY_USAGE = {

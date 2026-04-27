@@ -208,7 +208,7 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			const previewText = renderExternalizedPreview(stored.metadata, preview, settings.contextOpenDefaultMaxLines);
 
 			return {
-				content: replaceTextWithPreview(event.content, previewText),
+				llmContent: replaceTextWithPreview(event.content, previewText),
 				details: mergeContextGuardDetails(event.details, stored.contextGuard),
 				isError: event.isError,
 			};

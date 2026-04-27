@@ -771,6 +771,10 @@ export class ExtensionRunner {
 						currentEvent.content = handlerResult.content;
 						modified = true;
 					}
+					if (handlerResult.llmContent !== undefined) {
+						currentEvent.llmContent = handlerResult.llmContent;
+						modified = true;
+					}
 					if (handlerResult.details !== undefined) {
 						currentEvent.details = handlerResult.details;
 						modified = true;
@@ -796,11 +800,15 @@ export class ExtensionRunner {
 			return undefined;
 		}
 
-		return {
+		const result: ToolResultEventResult = {
 			content: currentEvent.content,
 			details: currentEvent.details,
 			isError: currentEvent.isError,
 		};
+		if (currentEvent.llmContent !== undefined) {
+			result.llmContent = currentEvent.llmContent;
+		}
+		return result;
 	}
 
 	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {

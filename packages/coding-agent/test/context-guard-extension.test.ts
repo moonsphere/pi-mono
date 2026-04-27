@@ -17,6 +17,7 @@ import type {
 	RegisteredTool,
 	ToolResultEventResult,
 } from "../src/core/extensions/types.js";
+import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { type CompactionEntry, SessionManager } from "../src/core/session-manager.js";
 
@@ -94,9 +95,10 @@ describe("context-guard extension", () => {
 		const largeOutput = Array.from({ length: 2500 }, (_, index) => `line ${index + 1}`).join("\n");
 
 		const result = await emitTextResult("bash", largeOutput, { command: "npm run check" });
-		const text = getText(result);
+		const text = getLlmText(result);
 
 		expect(result).toBeDefined();
+		expect(getText(result)).toContain("line 1200");
 		expect(text).toContain("[context-guard] Externalized bash output as cg_");
 		expect(text).toContain('context_open({ id: "cg_');
 		expect(text).toContain("startLine: 1");
@@ -110,12 +112,31 @@ describe("context-guard extension", () => {
 		expect(details?.contextGuard?.toolName).toBe("bash");
 	});
 
+	it("preserves display content while sending previews through llmContent", async () => {
+		const largeOutput = Array.from({ length: 2500 }, (_, index) => `display line ${index + 1}`).join("\n");
+
+		const result = await emitTextResult("bash", largeOutput, { command: "npm run check" });
+		const message = toolResultMessage("bash", result, { command: "npm run check" }, Date.now());
+		const [llmMessage] = convertToLlm([message]);
+
+		expect(getText(result)).toContain("display line 1200");
+		expect(getLlmText(result)).toContain("[context-guard] Externalized bash output as cg_");
+		expect(getLlmText(result)).not.toContain("display line 1200");
+		expect(llmMessage?.role).toBe("toolResult");
+		if (llmMessage?.role === "toolResult") {
+			expect(getToolText(llmMessage.content)).toContain("[context-guard] Externalized bash output as cg_");
+			expect(getToolText(llmMessage.content)).not.toContain("display line 1200");
+			expect(Object.hasOwn(llmMessage, "llmContent")).toBe(false);
+		}
+	});
+
 	it("uses head-only previews for search-like tools", async () => {
 		const largeOutput = Array.from({ length: 2500 }, (_, index) => `grep line ${index + 1}`).join("\n");
 
 		const result = await emitTextResult("grep", largeOutput, { pattern: "grep" });
-		const text = getText(result);
+		const text = getLlmText(result);
 
+		expect(getText(result)).toContain("grep line 2500");
 		expect(text).toContain("[context-guard] Externalized grep output as cg_");
 		expect(text).toContain("grep line 1");
 		expect(text).not.toContain("grep line 2500");
@@ -146,13 +167,16 @@ describe("context-guard extension", () => {
 
 		expect(result?.content?.[0]).toEqual(image);
 		expect(result?.content?.[1]?.type).toBe("text");
+		expect(result?.llmContent?.[0]).toEqual(image);
+		expect(result?.llmContent?.[1]?.type).toBe("text");
+		expect(getLlmText(result)).toContain("[context-guard] Externalized bash output as cg_");
 	});
 
 	it("preserves error status while externalizing oversized error results", async () => {
 		const result = await emitTextResult("bash", "error\n".repeat(3000), { command: "failing-command" }, {}, true);
 
 		expect(result?.isError).toBe(true);
-		expect(getText(result)).toContain("[context-guard] Externalized bash output as cg_");
+		expect(getLlmText(result)).toContain("[context-guard] Externalized bash output as cg_");
 	});
 
 	it("proactively externalizes medium read results when aggregate budget is exceeded", async () => {
@@ -164,7 +188,7 @@ describe("context-guard extension", () => {
 		}
 
 		expect(latest).toBeDefined();
-		expect(getText(latest)).toContain("[context-guard] Externalized read output as cg_");
+		expect(getLlmText(latest)).toContain("[context-guard] Externalized read output as cg_");
 	});
 
 	it("clears aggregate flood state after session compaction", async () => {
@@ -276,8 +300,10 @@ describe("context-guard extension", () => {
 
 		const transformed = await runner.emitContext(messages);
 
-		expect(getAgentMessageText(transformed[1])).toContain(`[context-guard] bash output ${id} externalized`);
-		expect(getAgentMessageText(transformed[1])).not.toContain("fold line 2500");
+		expect(getModelVisibleAgentMessageText(transformed[1])).toContain(
+			`[context-guard] bash output ${id} externalized`,
+		);
+		expect(getModelVisibleAgentMessageText(transformed[1])).not.toContain("fold line 2500");
 		expect(getAgentMessageText(messages[1])).toContain("fold line 2500");
 		expect(transformed.at(-1)).toEqual(messages.at(-1));
 	});
@@ -297,8 +323,10 @@ describe("context-guard extension", () => {
 			userMessage("latest prompt"),
 		]);
 
-		expect(getAgentMessageText(transformed[1])).toContain(`[context-guard] bash output ${id} externalized`);
-		expect(getAgentMessageText(transformed[1])).not.toContain("reload fold line 2500");
+		expect(getModelVisibleAgentMessageText(transformed[1])).toContain(
+			`[context-guard] bash output ${id} externalized`,
+		);
+		expect(getModelVisibleAgentMessageText(transformed[1])).not.toContain("reload fold line 2500");
 	});
 
 	it("folds by estimated request size when live usage is unavailable", async () => {
@@ -319,8 +347,10 @@ describe("context-guard extension", () => {
 
 		const transformed = await runner.emitContext(messages);
 
-		expect(getAgentMessageText(transformed[1])).toContain(`[context-guard] bash output ${id} externalized`);
-		expect(getAgentMessageText(transformed[1])).not.toContain("estimate fold line 2500");
+		expect(getModelVisibleAgentMessageText(transformed[1])).toContain(
+			`[context-guard] bash output ${id} externalized`,
+		);
+		expect(getModelVisibleAgentMessageText(transformed[1])).not.toContain("estimate fold line 2500");
 		expect(getAgentMessageText(messages[1])).toContain("estimate fold line 2500");
 	});
 
@@ -362,7 +392,7 @@ describe("context-guard extension", () => {
 		const result = await emitTextResult("read", "r".repeat(100 * 1024), { path: "medium.txt" });
 
 		expect(result).toBeDefined();
-		expect(getText(result)).toContain("[context-guard] Externalized read output as cg_");
+		expect(getLlmText(result)).toContain("[context-guard] Externalized read output as cg_");
 	});
 
 	it("treats missing usage as non-triggering and clears cached usage on session compaction", async () => {
@@ -445,7 +475,7 @@ describe("context-guard extension", () => {
 		const result = await emitTextResult("read", "small but configured large", { path: "config.txt" });
 
 		expect(result).toBeDefined();
-		expect(getText(result)).toContain("[context-guard] Externalized read output as cg_");
+		expect(getLlmText(result)).toContain("[context-guard] Externalized read output as cg_");
 	});
 
 	it("ignores unsafe numeric config overrides", async () => {
@@ -694,7 +724,7 @@ describe("context-guard extension", () => {
 		const recovered = await emitTextResult("bash", "x".repeat(60 * 1024), { command: "second" });
 
 		expect(recovered).toBeDefined();
-		expect(getText(recovered)).toContain("[context-guard] Externalized bash output as cg_");
+		expect(getLlmText(recovered)).toContain("[context-guard] Externalized bash output as cg_");
 	});
 
 	it("registers context guard commands", () => {
@@ -780,7 +810,7 @@ function toolResultMessage(
 	timestamp: number,
 	fallbackText?: string,
 ): ToolResultMessage {
-	return {
+	const message: ToolResultMessage = {
 		role: "toolResult",
 		toolName,
 		toolCallId: `context-${toolName}-${timestamp}`,
@@ -789,10 +819,18 @@ function toolResultMessage(
 		isError: false,
 		timestamp,
 	};
+	if (result?.llmContent !== undefined) {
+		message.llmContent = result.llmContent;
+	}
+	return message;
 }
 
 function getText(result: ToolResultEventResult | undefined): string {
 	return getToolText(result?.content ?? []);
+}
+
+function getLlmText(result: ToolResultEventResult | undefined): string {
+	return getToolText(result?.llmContent ?? result?.content ?? []);
 }
 
 function getToolText(content: (TextContent | ImageContent)[]): string {
@@ -832,6 +870,14 @@ function getAgentMessageText(message: AgentMessage | undefined): string {
 			return _exhaustive;
 		}
 	}
+}
+
+function getModelVisibleAgentMessageText(message: AgentMessage | undefined): string {
+	if (!message) return "";
+	if (message.role === "toolResult") {
+		return getToolText(message.llmContent ?? message.content);
+	}
+	return getAgentMessageText(message);
 }
 
 function countContextGuardMemoryMarkers(messages: AgentMessage[]): number {

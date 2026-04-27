@@ -654,6 +654,52 @@ describe("ExtensionRunner", () => {
 			expect(appendedText.sort()).toEqual(["ext1", "ext2"]);
 		});
 
+		it("chains llmContent modifications while preserving display content", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("tool_result", async (event) => {
+						return {
+							llmContent: [...(event.llmContent ?? event.content), { type: "text", text: "llm1" }],
+						};
+					});
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("tool_result", async (event) => {
+						return {
+							llmContent: [...(event.llmContent ?? event.content), { type: "text", text: "llm2" }],
+						};
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-llm-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-llm-2.ts"), extCode2);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			const chained = await runner.emitToolResult({
+				type: "tool_result",
+				toolName: "my_tool",
+				toolCallId: "call-llm",
+				input: {},
+				content: [{ type: "text", text: "base" }],
+				details: { initial: true },
+				isError: false,
+			});
+
+			expect(chained).toBeDefined();
+			expect(chained?.content).toEqual([{ type: "text", text: "base" }]);
+			expect(chained?.llmContent?.[0]).toEqual({ type: "text", text: "base" });
+			expect(chained?.llmContent).toHaveLength(3);
+			const appendedText = chained?.llmContent
+				?.slice(1)
+				.filter((item): item is { type: "text"; text: string } => item.type === "text")
+				.map((item) => item.text);
+			expect(appendedText?.sort()).toEqual(["llm1", "llm2"]);
+		});
+
 		it("preserves previous modifications when later handlers return partial patches", async () => {
 			const extCode1 = `
 				export default function(pi) {

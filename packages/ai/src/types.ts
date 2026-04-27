@@ -229,6 +229,8 @@ export interface ToolResultMessage<TDetails = any> {
 	toolCallId: string;
 	toolName: string;
 	content: (TextContent | ImageContent)[]; // Supports text and images
+	/** Optional model-visible content. When present, callers may use this instead of content for LLM requests. */
+	llmContent?: (TextContent | ImageContent)[];
 	details?: TDetails;
 	isError: boolean;
 	timestamp: number; // Unix timestamp in milliseconds

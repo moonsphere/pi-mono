@@ -40,6 +40,7 @@ The agent works with `AgentMessage`, a flexible type that can include:
 - Custom app-specific message types via declaration merging
 
 LLMs only understand `user`, `assistant`, and `toolResult`. The `convertToLlm` function bridges this gap by filtering and transforming messages before each LLM call.
+Tool results can optionally carry `llmContent`; when present, converters should send that as the model-visible `content` while preserving the original `content` for session/UI display.
 
 ### Message Flow
 
@@ -449,7 +450,14 @@ const context: AgentContext = {
 
 const config: AgentLoopConfig = {
   model: getModel("openai", "gpt-4o"),
-  convertToLlm: (msgs) => msgs.filter(m => ["user", "assistant", "toolResult"].includes(m.role)),
+  convertToLlm: (msgs) => msgs.flatMap(m => {
+    if (!["user", "assistant", "toolResult"].includes(m.role)) return [];
+    if (m.role === "toolResult" && m.llmContent) {
+      const { llmContent, ...message } = m;
+      return [{ ...message, content: llmContent }];
+    }
+    return [m];
+  }),
   toolExecution: "parallel",  // overridden by per-tool executionMode if set
   beforeToolCall: async ({ toolCall, args, context }) => undefined,
   afterToolCall: async ({ toolCall, result, isError, context }) => undefined,

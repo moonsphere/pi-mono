@@ -1,4 +1,10 @@
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@mariozechner/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	EventStream,
+	getModel,
+	type ToolResultMessage,
+} from "@mariozechner/pi-ai";
 import { describe, expect, it } from "vitest";
 import { Agent } from "../src/index.js";
 
@@ -76,6 +82,28 @@ describe("Agent", () => {
 		expect(agent.state.systemPrompt).toBe("You are a helpful assistant.");
 		expect(agent.state.model).toBe(customModel);
 		expect(agent.state.thinkingLevel).toBe("low");
+	});
+
+	it("should use llmContent in the default LLM converter", async () => {
+		const agent = new Agent();
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "full output" }],
+			llmContent: [{ type: "text", text: "preview output" }],
+			details: {},
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const [converted] = await agent.convertToLlm([toolResult]);
+
+		expect(converted?.role).toBe("toolResult");
+		if (converted?.role === "toolResult") {
+			expect(converted.content).toEqual([{ type: "text", text: "preview output" }]);
+			expect(Object.hasOwn(converted, "llmContent")).toBe(false);
+		}
 	});
 
 	it("should subscribe to events", () => {

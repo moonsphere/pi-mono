@@ -118,9 +118,10 @@ function foldToolResults(
 		if (!id) continue;
 		const replacement = options.replacements.getReplacement(id);
 		if (!replacement) continue;
-		const nextContent = replaceTextWithFoldReference(message.content, replacement);
-		if (contentText(nextContent) === contentText(message.content)) continue;
-		message.content = nextContent;
+		const currentContent = message.llmContent ?? message.content;
+		const nextContent = replaceTextWithFoldReference(currentContent, replacement);
+		if (contentText(nextContent) === contentText(currentContent)) continue;
+		message.llmContent = nextContent;
 		currentEstimate = estimateMessagesTokens(messages);
 		changed = true;
 		forceFirstFold = false;
@@ -244,7 +245,7 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 				bytes += estimateContentBytes(message.content);
 				break;
 			case "toolResult":
-				bytes += countBytes(message.toolName) + estimateContentBytes(message.content);
+				bytes += countBytes(message.toolName) + estimateContentBytes(message.llmContent ?? message.content);
 				break;
 			case "assistant":
 				bytes += estimateContentBytes(message.content);

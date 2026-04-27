@@ -417,6 +417,7 @@ export class AgentSession {
 
 			return {
 				content: hookResult.content,
+				llmContent: hookResult.llmContent,
 				details: hookResult.details,
 				isError: hookResult.isError ?? isError,
 			};
