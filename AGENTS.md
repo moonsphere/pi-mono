@@ -169,6 +169,7 @@ Create provider file exporting:
 ### 7. Documentation
 
 - `packages/ai/README.md`: Add to providers table, document options/auth, add env vars
+- `docs/solutions/`: documented solutions to past problems and practices, organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in documented areas
 - `packages/ai/CHANGELOG.md`: Add entry under `## [Unreleased]`
 
 ## Releasing
