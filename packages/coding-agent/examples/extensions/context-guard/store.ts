@@ -67,6 +67,10 @@ export interface StoreStats {
 	storeDir: string;
 }
 
+export interface FoldReferenceLookup {
+	getReplacement(id: string): string | undefined;
+}
+
 interface ReplacementRecord {
 	id: string;
 	foldReference: string;
@@ -313,6 +317,47 @@ export class ContextGuardStore {
 		});
 	}
 
+	async applyRetention(options: { liveIds?: Set<string>; now?: number } = {}): Promise<void> {
+		const liveIds = options.liveIds ?? new Set<string>();
+		const now = options.now ?? Date.now();
+		await this.enqueueMetadataWrite(async () => {
+			const deleteIds = new Set<string>();
+			const maxAgeMs = this.settings.retention.maxObjectAgeMs;
+			if (Number.isFinite(maxAgeMs) && maxAgeMs >= 0) {
+				const cutoff = now - maxAgeMs;
+				for (const metadata of this.metadataById.values()) {
+					if (!liveIds.has(metadata.id) && metadata.createdTime < cutoff) {
+						deleteIds.add(metadata.id);
+					}
+				}
+			}
+
+			const maxTotalBytes = this.settings.retention.maxTotalStoreBytes;
+			if (Number.isFinite(maxTotalBytes) && maxTotalBytes >= 0) {
+				let totalBytes = 0;
+				const retained = Array.from(this.metadataById.values())
+					.filter((metadata) => !deleteIds.has(metadata.id))
+					.sort((a, b) => a.createdTime - b.createdTime);
+				for (const metadata of retained) totalBytes += metadata.byteCount;
+				for (const metadata of retained) {
+					if (totalBytes <= maxTotalBytes) break;
+					if (liveIds.has(metadata.id)) continue;
+					deleteIds.add(metadata.id);
+					totalBytes -= metadata.byteCount;
+				}
+			}
+
+			if (deleteIds.size === 0) return;
+			for (const id of deleteIds) {
+				const metadata = this.metadataById.get(id);
+				if (!metadata) continue;
+				await unlink(metadata.objectPath).catch(() => {});
+				this.metadataById.delete(id);
+			}
+			await this.rewriteIndexSegments();
+		});
+	}
+
 	async drain(): Promise<void> {
 		await this.metadataQueue;
 	}
@@ -329,7 +374,7 @@ export class ContextGuardStore {
 			const content = await readFile(path.join(this.indexDir, entry.name), "utf-8").catch(() => "");
 			for (const line of content.split("\n")) {
 				if (!line.trim()) continue;
-				const parsed = parseMetadataRecord(line);
+				const parsed = parseMetadataRecord(line, this.cwd, this.objectsDir);
 				if (parsed) this.metadataById.set(parsed.id, parsed);
 			}
 		}
@@ -359,6 +404,29 @@ export class ContextGuardStore {
 	private async appendIndexRecord(sessionKey: string, record: MetadataRecord): Promise<void> {
 		const segmentPath = path.join(this.indexDir, `${sessionKey}.jsonl`);
 		await appendFile(segmentPath, `${JSON.stringify(record)}\n`, "utf-8");
+	}
+
+	private async rewriteIndexSegments(): Promise<void> {
+		const grouped = new Map<string, ContextGuardMetadata[]>();
+		for (const metadata of this.metadataById.values()) {
+			const records = grouped.get(metadata.sessionKey) ?? [];
+			records.push(metadata);
+			grouped.set(metadata.sessionKey, records);
+		}
+		await mkdir(this.indexDir, { recursive: true });
+		const existingSegments = await readdir(this.indexDir, { withFileTypes: true }).catch(() => []);
+		for (const [sessionKey, records] of grouped) {
+			if (records.length === 0) continue;
+			const content = records.map((record) => JSON.stringify({ ...record, recordType: "metadata" })).join("\n");
+			await atomicWriteFile(path.join(this.indexDir, `${sessionKey}.jsonl`), `${content}\n`);
+		}
+		for (const entry of existingSegments) {
+			if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+			const sessionKey = entry.name.slice(0, -".jsonl".length);
+			if (!grouped.has(sessionKey)) {
+				await rm(path.join(this.indexDir, entry.name), { force: true }).catch(() => {});
+			}
+		}
 	}
 
 	private enqueueMetadataWrite(task: () => Promise<void>): Promise<void> {
@@ -411,6 +479,23 @@ export class ContextGuardStore {
 		}
 		return this.writeFailures.length >= this.settings.writeFailureCircuitBreaker.failures;
 	}
+}
+
+export async function loadFoldReferences(cwd: string, settings: ContextGuardSettings): Promise<Map<string, string>> {
+	const replacements = new Map<string, string>();
+	const replacementsPath = path.join(path.resolve(cwd, settings.storeDir), "replacements.jsonl");
+	const fileStat = await stat(replacementsPath).catch(() => undefined);
+	if (!fileStat || fileStat.size > settings.replacementsLoadMaxBytes) return replacements;
+	const content = await readFile(replacementsPath, "utf-8").catch(() => undefined);
+	if (content === undefined) return replacements;
+	for (const line of content.split("\n")) {
+		if (!line.trim()) continue;
+		const parsed = parseReplacementRecord(line);
+		if (parsed && !replacements.has(parsed.id)) {
+			replacements.set(parsed.id, parsed.foldReference);
+		}
+	}
+	return replacements;
 }
 
 export function sanitizeSessionKey(sessionId: string | undefined): string {
@@ -535,27 +620,28 @@ function clampLine(line: number, totalLines: number): number {
 	return Math.min(Math.max(1, Math.floor(line)), totalLines);
 }
 
-function parseMetadataRecord(line: string): ContextGuardMetadata | undefined {
+function parseMetadataRecord(line: string, cwd: string, objectsDir: string): ContextGuardMetadata | undefined {
 	const parsed = parseJsonObject(line);
 	if (!parsed) return undefined;
 	const sketch = parseTokenSketch(parsed.sketch);
 	if (
 		parsed.recordType !== "metadata" ||
 		typeof parsed.id !== "string" ||
+		!isSafeContextGuardId(parsed.id) ||
 		typeof parsed.toolName !== "string" ||
-		typeof parsed.objectPath !== "string" ||
 		typeof parsed.title !== "string" ||
 		typeof parsed.createdTime !== "number" ||
 		typeof parsed.byteCount !== "number" ||
 		typeof parsed.lineCount !== "number" ||
 		typeof parsed.sessionKey !== "string" ||
-		typeof parsed.relativeObjectPath !== "string" ||
+		sanitizeSessionKey(parsed.sessionKey) !== parsed.sessionKey ||
 		typeof parsed.isError !== "boolean" ||
 		!isPreviewStrategy(parsed.previewStrategy) ||
 		!sketch
 	) {
 		return undefined;
 	}
+	const objectPath = path.join(objectsDir, parsed.sessionKey, `${parsed.id}.txt`);
 	return {
 		id: parsed.id,
 		sessionKey: parsed.sessionKey,
@@ -566,11 +652,15 @@ function parseMetadataRecord(line: string): ContextGuardMetadata | undefined {
 		createdTime: parsed.createdTime,
 		isError: parsed.isError,
 		previewStrategy: parsed.previewStrategy,
-		objectPath: parsed.objectPath,
-		relativeObjectPath: parsed.relativeObjectPath,
+		objectPath,
+		relativeObjectPath: path.relative(cwd, objectPath),
 		title: parsed.title,
 		sketch,
 	};
+}
+
+function isSafeContextGuardId(value: string): boolean {
+	return /^cg_[A-Za-z0-9_-]+$/.test(value);
 }
 
 function parseReplacementRecord(line: string): ReplacementRecord | undefined {

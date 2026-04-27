@@ -1,14 +1,22 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { ImageContent, TextContent, ToolResultMessage } from "@mariozechner/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import contextGuardExtension from "../examples/extensions/context-guard/index.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { DEFAULT_COMPACTION_SETTINGS } from "../src/core/compaction/index.js";
 import { createEventBus } from "../src/core/event-bus.js";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
-import type { RegisteredTool, ToolResultEventResult } from "../src/core/extensions/types.js";
+import type {
+	ContextUsage,
+	ExtensionActions,
+	ExtensionContextActions,
+	RegisteredTool,
+	ToolResultEventResult,
+} from "../src/core/extensions/types.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { type CompactionEntry, SessionManager } from "../src/core/session-manager.js";
 
@@ -17,12 +25,39 @@ describe("context-guard extension", () => {
 	let runner: ExtensionRunner;
 	let sessionManager: SessionManager;
 	let modelRegistry: ModelRegistry;
+	let contextUsage: ContextUsage | undefined;
+
+	const extensionActions: ExtensionActions = {
+		sendMessage: () => {},
+		sendUserMessage: () => {},
+		appendEntry: () => {},
+		setSessionName: () => {},
+		getSessionName: () => undefined,
+		setLabel: () => {},
+		getActiveTools: () => [],
+		getAllTools: () => [],
+		setActiveTools: () => {},
+		refreshTools: () => {},
+		getCommands: () => [],
+		setModel: async () => false,
+		getThinkingLevel: () => "off",
+		setThinkingLevel: () => {},
+	};
 
 	beforeEach(async () => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-context-guard-extension-"));
+		contextUsage = undefined;
 		sessionManager = SessionManager.inMemory();
 		const authStorage = AuthStorage.create(path.join(tempDir, "auth.json"));
 		modelRegistry = ModelRegistry.create(authStorage);
+		await reloadExtension();
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	async function reloadExtension(): Promise<void> {
 		const runtime = createExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
 			contextGuardExtension,
@@ -32,11 +67,22 @@ describe("context-guard extension", () => {
 			"<context-guard-test>",
 		);
 		runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-	});
+		runner.bindCore(extensionActions, createContextActions());
+	}
 
-	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
-	});
+	function createContextActions(): ExtensionContextActions {
+		return {
+			getModel: () => undefined,
+			isIdle: () => true,
+			getSignal: () => undefined,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => contextUsage,
+			compact: () => {},
+			getSystemPrompt: () => "",
+		};
+	}
 
 	it("leaves small tool results unchanged", async () => {
 		const result = await emitTextResult("bash", "small output", { command: "echo small" });
@@ -207,6 +253,416 @@ describe("context-guard extension", () => {
 		expect(text).not.toContain("rare-command-token");
 	});
 
+	it("leaves request context unchanged below the injection and microcompact thresholds", async () => {
+		contextUsage = { tokens: 1000, contextWindow: 200_000, percent: 0.5 };
+		const messages = [userMessage("hello")];
+
+		const transformed = await runner.emitContext(messages);
+
+		expect(transformed).toEqual(messages);
+	});
+
+	it("folds old externalized tool results in request context without mutating session messages", async () => {
+		writeContextGuardConfig({ microcompactRecentMessages: 1 });
+		const largeOutput = Array.from({ length: 2500 }, (_, index) => `fold line ${index + 1}`).join("\n");
+		const externalized = await emitTextResult("bash", largeOutput, { command: "long-output" });
+		const id = getContextGuardId(externalized);
+		contextUsage = { tokens: 3500, contextWindow: 4000, percent: 87.5 };
+		const messages = [
+			userMessage("start"),
+			toolResultMessage("bash", externalized, { command: "long-output" }, Date.now() - 1000),
+			userMessage("latest prompt"),
+		];
+
+		const transformed = await runner.emitContext(messages);
+
+		expect(getAgentMessageText(transformed[1])).toContain(`[context-guard] bash output ${id} externalized`);
+		expect(getAgentMessageText(transformed[1])).not.toContain("fold line 2500");
+		expect(getAgentMessageText(messages[1])).toContain("fold line 2500");
+		expect(transformed.at(-1)).toEqual(messages.at(-1));
+	});
+
+	it("loads persisted fold references during request microcompact after extension reload", async () => {
+		writeContextGuardConfig({ microcompactRecentMessages: 1 });
+		const largeOutput = Array.from({ length: 2500 }, (_, index) => `reload fold line ${index + 1}`).join("\n");
+		const externalized = await emitTextResult("bash", largeOutput, { command: "reload-long-output" });
+		const id = getContextGuardId(externalized);
+		await reloadExtension();
+		await runner.emitBeforeAgentStart("latest prompt", undefined, "system prompt", { cwd: tempDir });
+		contextUsage = { tokens: 3500, contextWindow: 4000, percent: 87.5 };
+
+		const transformed = await runner.emitContext([
+			userMessage("start"),
+			toolResultMessage("bash", externalized, { command: "reload-long-output" }, Date.now() - 1000),
+			userMessage("latest prompt"),
+		]);
+
+		expect(getAgentMessageText(transformed[1])).toContain(`[context-guard] bash output ${id} externalized`);
+		expect(getAgentMessageText(transformed[1])).not.toContain("reload fold line 2500");
+	});
+
+	it("folds by estimated request size when live usage is unavailable", async () => {
+		writeContextGuardConfig({
+			defaultContextWindow: 1000,
+			microcompactTargetRatio: 0.2,
+			microcompactRecentMessages: 1,
+		});
+		const largeOutput = Array.from({ length: 2500 }, (_, index) => `estimate fold line ${index + 1}`).join("\n");
+		const externalized = await emitTextResult("bash", largeOutput, { command: "estimated-long-output" });
+		const id = getContextGuardId(externalized);
+		contextUsage = undefined;
+		const messages = [
+			userMessage("start"),
+			toolResultMessage("bash", externalized, { command: "estimated-long-output" }, Date.now() - 1000),
+			userMessage("latest prompt"),
+		];
+
+		const transformed = await runner.emitContext(messages);
+
+		expect(getAgentMessageText(transformed[1])).toContain(`[context-guard] bash output ${id} externalized`);
+		expect(getAgentMessageText(transformed[1])).not.toContain("estimate fold line 2500");
+		expect(getAgentMessageText(messages[1])).toContain("estimate fold line 2500");
+	});
+
+	it("injects bounded request memory before the latest user message and replaces prior generated markers", async () => {
+		await runner.emit({ type: "message_end", message: userMessage("Remember the active task") });
+		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
+		const messages = [userMessage("latest prompt")];
+
+		const first = await runner.emitContext(messages);
+		const second = await runner.emitContext(first);
+		const firstMarkerId = extractContextGuardMemoryMarkerId(first);
+		const secondMarkerId = extractContextGuardMemoryMarkerId(second);
+
+		expect(first).toHaveLength(2);
+		expect(first[0]?.role).toBe("custom");
+		expect(first.at(-1)).toEqual(messages[0]);
+		expect(countContextGuardMemoryMarkers(second)).toBe(1);
+		expect(secondMarkerId).toBeDefined();
+		expect(secondMarkerId).not.toBe(firstMarkerId);
+		expect(getAgentMessageText(second[0])).not.toContain(`id="${firstMarkerId}"`);
+		expect(second.at(-1)).toEqual(messages[0]);
+	});
+
+	it("skips request memory injection when no latest user message exists", async () => {
+		await runner.emit({ type: "message_end", message: userMessage("Remember the active task") });
+		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
+
+		const transformed = await runner.emitContext([
+			toolResultMessage("bash", undefined, { command: "echo done" }, Date.now(), "done"),
+		]);
+
+		expect(countContextGuardMemoryMarkers(transformed)).toBe(0);
+	});
+
+	it("uses latest context usage to proactively externalize below-threshold outputs", async () => {
+		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
+		await runner.emitContext([userMessage("prime usage")]);
+
+		const result = await emitTextResult("read", "r".repeat(100 * 1024), { path: "medium.txt" });
+
+		expect(result).toBeDefined();
+		expect(getText(result)).toContain("[context-guard] Externalized read output as cg_");
+	});
+
+	it("treats missing usage as non-triggering and clears cached usage on session compaction", async () => {
+		const mediumOutput = "r".repeat(100 * 1024);
+
+		const quietBeforeUsage = await emitTextResult("read", mediumOutput, { path: "before-usage.txt" });
+		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
+		await runner.emitContext([userMessage("prime usage")]);
+		const externalized = await emitTextResult("read", mediumOutput, { path: "after-usage.txt" });
+		await runner.emit({
+			type: "session_compact",
+			compactionEntry: createCompactionEntry(),
+			fromExtension: false,
+		});
+		contextUsage = undefined;
+		const quietAfterCompact = await emitTextResult("read", mediumOutput, { path: "after-compact-usage.txt" });
+
+		expect(quietBeforeUsage).toBeUndefined();
+		expect(externalized).toBeDefined();
+		expect(quietAfterCompact).toBeUndefined();
+	});
+
+	it("builds custom compaction summaries from structured memory", async () => {
+		await runner.emit({ type: "message_end", message: userMessage("Fix context guard compaction") });
+		await emitTextResult("read", "small file", { path: "src/context.ts" });
+		await emitTextResult("bash", "command failed", { command: "npm run check" }, {}, true);
+		const externalized = await emitTextResult("bash", "x".repeat(60 * 1024), { command: "long-output" });
+		const id = getContextGuardId(externalized);
+
+		const result = await runner.emit({
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: "keep-entry",
+				messagesToSummarize: [],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 1234,
+				fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+				settings: DEFAULT_COMPACTION_SETTINGS,
+			},
+			branchEntries: [],
+			signal: new AbortController().signal,
+		});
+
+		expect(result?.compaction?.firstKeptEntryId).toBe("keep-entry");
+		expect(result?.compaction?.summary).toContain("## Goal");
+		expect(result?.compaction?.summary).toContain("Fix context guard compaction");
+		expect(result?.compaction?.summary).toContain("tokensBefore=1234");
+		expect(result?.compaction?.summary).toContain("src/context.ts");
+		expect(result?.compaction?.summary).toContain("command failed");
+		expect(result?.compaction?.summary).toContain(id);
+		expect(result?.compaction?.summary).not.toContain("## Decisions");
+		expect(Buffer.byteLength(result?.compaction?.summary ?? "", "utf-8")).toBeLessThan(25 * 1024);
+	});
+
+	it("does not replace core compaction when Pi has messages to summarize", async () => {
+		await runner.emit({ type: "message_end", message: userMessage("Keep default compaction") });
+
+		const result = await runner.emit({
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: "keep-entry",
+				messagesToSummarize: [userMessage("important branch content")],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 1234,
+				fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+				settings: DEFAULT_COMPACTION_SETTINGS,
+			},
+			branchEntries: [],
+			signal: new AbortController().signal,
+		});
+
+		expect(result).toBeUndefined();
+	});
+
+	it("loads extension-local config overrides before classifying tool results", async () => {
+		writeContextGuardConfig({ thresholds: { read: { maxBytes: 10, maxLines: 2000, previewStrategy: "head" } } });
+
+		const result = await emitTextResult("read", "small but configured large", { path: "config.txt" });
+
+		expect(result).toBeDefined();
+		expect(getText(result)).toContain("[context-guard] Externalized read output as cg_");
+	});
+
+	it("ignores unsafe numeric config overrides", async () => {
+		writeContextGuardConfig({
+			aggregateWindowSize: -1,
+			thresholds: { read: { maxBytes: -1, maxLines: -1, previewStrategy: "head" } },
+		});
+
+		const result = await emitTextResult("read", "small output", { path: "config.txt" });
+
+		expect(result).toBeUndefined();
+	});
+
+	it("ignores unsafe store directory overrides", async () => {
+		writeContextGuardConfig({ storeDir: ".", thresholds: { bash: { maxBytes: 10 } } });
+		const parentSentinel = path.join(
+			path.dirname(tempDir),
+			`context-guard-parent-sentinel-${path.basename(tempDir)}`,
+		);
+		const projectSentinel = path.join(tempDir, "project-sentinel");
+		fs.writeFileSync(parentSentinel, "keep");
+		fs.writeFileSync(projectSentinel, "keep");
+
+		try {
+			const result = await emitTextResult("bash", "x".repeat(100), { command: "echo unsafe-store" });
+			await getCommand("context-guard:purge").handler("--force", runner.createCommandContext());
+
+			expect(result).toBeDefined();
+			expect(fs.existsSync(path.join(tempDir, ".pi", "context-guard"))).toBe(true);
+			expect(fs.existsSync(parentSentinel)).toBe(true);
+			expect(fs.existsSync(projectSentinel)).toBe(true);
+		} finally {
+			fs.rmSync(parentSentinel, { force: true });
+		}
+	});
+
+	it("ignores parent-relative store directory overrides", async () => {
+		writeContextGuardConfig({ storeDir: "..", thresholds: { bash: { maxBytes: 10 } } });
+		const parentSentinel = path.join(
+			path.dirname(tempDir),
+			`context-guard-parent-sentinel-${path.basename(tempDir)}`,
+		);
+		fs.writeFileSync(parentSentinel, "keep");
+
+		try {
+			const result = await emitTextResult("bash", "x".repeat(100), { command: "echo unsafe-parent-store" });
+			await getCommand("context-guard:purge").handler("--force", runner.createCommandContext());
+
+			expect(result).toBeDefined();
+			expect(fs.existsSync(path.join(tempDir, ".pi", "context-guard"))).toBe(true);
+			expect(fs.existsSync(parentSentinel)).toBe(true);
+		} finally {
+			fs.rmSync(parentSentinel, { force: true });
+		}
+	});
+
+	it("refuses active-session purge without force", async () => {
+		const notifications = bindNotifications();
+		const externalized = await emitTextResult("bash", "x".repeat(60 * 1024), { command: "active-purge" });
+		const id = getContextGuardId(externalized);
+
+		await getCommand("context-guard:purge").handler("", runner.createCommandContext());
+		const opened = await getTool("context_open").definition.execute(
+			"open-active",
+			{ id, maxLines: 1 },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+
+		expect(notifications.at(-1)?.message).toContain("purge refused");
+		expect(getToolText(opened.content)).toContain(id);
+		expect(fs.existsSync(path.join(tempDir, ".pi", "context-guard"))).toBe(true);
+	});
+
+	it("retention keeps ids referenced by resumed session history", async () => {
+		writeContextGuardConfig({ retention: { maxObjectAgeMs: 30 * 24 * 60 * 60 * 1000, maxTotalStoreBytes: 1 } });
+		const first = await emitTextResult("bash", "x".repeat(60 * 1024), { command: "resumed-live" });
+		const firstId = getContextGuardId(first);
+		sessionManager.appendMessage(toolResultMessage("bash", first, { command: "resumed-live" }, Date.now()));
+		await reloadExtension();
+
+		await emitTextResult("bash", "y".repeat(60 * 1024), { command: "trigger-retention" });
+		const opened = await getTool("context_open").definition.execute(
+			"open-retained",
+			{ id: firstId, maxLines: 1 },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+
+		expect(getToolText(opened.content)).toContain(firstId);
+		expect(getToolText(opened.content)).not.toContain("expired or missing");
+	});
+
+	it("keeps system metadata from evicting user memory events", async () => {
+		writeContextGuardConfig({ memoryEventLimit: 1 });
+		await runner.emit({ type: "message_end", message: userMessage("Keep this goal") });
+		await runner.emitBeforeAgentStart("ignored", undefined, "system prompt one", { cwd: tempDir });
+		await runner.emitBeforeAgentStart("ignored", undefined, "system prompt two", { cwd: tempDir });
+
+		const result = await runner.emit({
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: "keep-entry",
+				messagesToSummarize: [],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 1234,
+				fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+				settings: DEFAULT_COMPACTION_SETTINGS,
+			},
+			branchEntries: [],
+			signal: new AbortController().signal,
+		});
+
+		expect(result?.compaction?.summary).toContain("Keep this goal");
+		expect(result?.compaction?.summary).toContain("systemPromptHash=");
+	});
+
+	it("warns on curl stdout and blocks predictably unbounded commands", async () => {
+		const notifications = bindNotifications();
+
+		const warned = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "curl-call",
+			input: { command: "curl https://example.com" },
+		});
+		const allowed = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "curl-output-call",
+			input: { command: "curl -o page.html https://example.com" },
+		});
+		const wgetDefault = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "wget-default-call",
+			input: { command: "wget https://example.com/page.html" },
+		});
+		const echoYes = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "echo-yes-call",
+			input: { command: "echo yes" },
+		});
+		const boundedYes = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "yes-head-call",
+			input: { command: "yes | head -n 1" },
+		});
+		const boundedUrandom = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "urandom-head-call",
+			input: { command: "head -c 16 /dev/urandom" },
+		});
+		const blockedUrandom = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "urandom-call",
+			input: { command: "cat /dev/urandom" },
+		});
+		const laterUnboundedYes = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "yes-compound-call",
+			input: { command: "yes | head -n 1; yes" },
+		});
+		const blocked = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			toolCallId: "yes-call",
+			input: { command: "yes" },
+		});
+
+		expect(warned).toBeUndefined();
+		expect(notifications.at(-1)?.message).toContain("curl/wget");
+		expect(allowed).toBeUndefined();
+		expect(wgetDefault).toBeUndefined();
+		expect(echoYes).toBeUndefined();
+		expect(boundedYes).toBeUndefined();
+		expect(boundedUrandom).toBeUndefined();
+		expect(blockedUrandom?.block).toBe(true);
+		expect(laterUnboundedYes?.block).toBe(true);
+		expect(blocked?.block).toBe(true);
+	});
+
+	it("clamps configured context_open defaults to max limits", async () => {
+		writeContextGuardConfig({
+			contextOpenDefaultMaxLines: 100,
+			contextOpenMaxLines: 3,
+			thresholds: { bash: { maxBytes: 10 } },
+		});
+		const externalized = await emitTextResult(
+			"bash",
+			Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"),
+			{
+				command: "clamp-open",
+			},
+		);
+		const id = getContextGuardId(externalized);
+
+		const opened = await getTool("context_open").definition.execute(
+			"open-clamped",
+			{ id },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+
+		expect(getToolText(opened.content)).toContain("lines 1-3");
+		expect(getToolText(opened.content)).not.toContain("line 4");
+	});
+
 	it("reports stats and purges only context-guard data", async () => {
 		const notifications = bindNotifications();
 		const unrelatedPath = path.join(tempDir, "keep.txt");
@@ -217,7 +673,7 @@ describe("context-guard extension", () => {
 		expect(notifications.at(-1)?.message).toContain("objects: 1");
 		expect(notifications.at(-1)?.message).toContain("- bash: 1 outputs");
 
-		await getCommand("context-guard:purge").handler("", runner.createCommandContext());
+		await getCommand("context-guard:purge").handler("--force", runner.createCommandContext());
 
 		expect(fs.existsSync(unrelatedPath)).toBe(true);
 		expect(notifications.at(-1)?.message).toBe("context-guard store purged");
@@ -289,6 +745,12 @@ describe("context-guard extension", () => {
 		});
 		return notifications;
 	}
+
+	function writeContextGuardConfig(config: Record<string, unknown>): void {
+		const configDir = path.join(tempDir, ".pi", "context-guard");
+		fs.mkdirSync(configDir, { recursive: true });
+		fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify(config), "utf-8");
+	}
 });
 
 function createCompactionEntry(): CompactionEntry {
@@ -300,6 +762,32 @@ function createCompactionEntry(): CompactionEntry {
 		summary: "summary",
 		firstKeptEntryId: "entry-id",
 		tokensBefore: 1000,
+	};
+}
+
+function userMessage(text: string, timestamp = Date.now()): AgentMessage {
+	return {
+		role: "user",
+		content: [{ type: "text", text }],
+		timestamp,
+	};
+}
+
+function toolResultMessage(
+	toolName: string,
+	result: ToolResultEventResult | undefined,
+	_input: Record<string, unknown>,
+	timestamp: number,
+	fallbackText?: string,
+): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolName,
+		toolCallId: `context-${toolName}-${timestamp}`,
+		content: result?.content ?? [{ type: "text", text: fallbackText ?? "" }],
+		details: result?.details ?? {},
+		isError: false,
+		timestamp,
 	};
 }
 
@@ -319,4 +807,41 @@ function getContextGuardId(result: ToolResultEventResult | undefined): string {
 	const id = details?.contextGuard?.id;
 	if (!id) throw new Error("missing context guard id");
 	return id;
+}
+
+function getAgentMessageText(message: AgentMessage | undefined): string {
+	if (!message) return "";
+	switch (message.role) {
+		case "user":
+		case "custom":
+			return typeof message.content === "string" ? message.content : getToolText(message.content);
+		case "toolResult":
+			return getToolText(message.content);
+		case "assistant":
+			return message.content
+				.filter((item): item is TextContent => item.type === "text")
+				.map((item) => item.text)
+				.join("\n");
+		case "bashExecution":
+			return `${message.command}\n${message.output}`;
+		case "branchSummary":
+		case "compactionSummary":
+			return message.summary;
+		default: {
+			const _exhaustive: never = message;
+			return _exhaustive;
+		}
+	}
+}
+
+function countContextGuardMemoryMarkers(messages: AgentMessage[]): number {
+	return messages.filter((message) => getAgentMessageText(message).includes("<context_guard_memory id=")).length;
+}
+
+function extractContextGuardMemoryMarkerId(messages: AgentMessage[]): string | undefined {
+	for (const message of messages) {
+		const match = getAgentMessageText(message).match(/<context_guard_memory id="([^"]+)">/);
+		if (match) return match[1];
+	}
+	return undefined;
 }

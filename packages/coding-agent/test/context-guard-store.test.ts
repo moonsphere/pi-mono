@@ -235,6 +235,86 @@ describe("context-guard store", () => {
 		expect(opened.text).toContain("expired or missing");
 	});
 
+	it("retains fold references while expiring old object metadata", async () => {
+		const settings = mergeSettings(DEFAULT_CONTEXT_GUARD_SETTINGS, {
+			retention: { maxObjectAgeMs: 1, maxTotalStoreBytes: Number.MAX_SAFE_INTEGER },
+		});
+		const store = new ContextGuardStore(tempDir, settings);
+		await store.initialize();
+		const stored = await store.storeOutput({
+			sessionId: "session-one",
+			toolName: "bash",
+			text: "expired output",
+			input: { command: "old" },
+			isError: false,
+			previewStrategy: "head-tail-middle-strip",
+		});
+		await store.writeFoldReference(stored.metadata, "stable fold reference");
+
+		await store.applyRetention({ now: stored.metadata.createdTime + 10 });
+
+		expect(store.getMetadata(stored.metadata.id)).toBeUndefined();
+		expect(store.getReplacement(stored.metadata.id)).toBe("stable fold reference");
+		expect(fs.existsSync(stored.metadata.objectPath)).toBe(false);
+		expect(fs.existsSync(path.join(tempDir, ".pi", "context-guard", "index", "session-one.jsonl"))).toBe(false);
+	});
+
+	it("skips live ids during retention", async () => {
+		const settings = mergeSettings(DEFAULT_CONTEXT_GUARD_SETTINGS, {
+			retention: { maxObjectAgeMs: 1, maxTotalStoreBytes: 1 },
+		});
+		const store = new ContextGuardStore(tempDir, settings);
+		await store.initialize();
+		const stored = await store.storeOutput({
+			sessionId: "session-one",
+			toolName: "read",
+			text: "live output",
+			input: { path: "live.txt" },
+			isError: false,
+			previewStrategy: "head",
+		});
+
+		await store.applyRetention({ liveIds: new Set([stored.metadata.id]), now: stored.metadata.createdTime + 10 });
+
+		expect(store.getMetadata(stored.metadata.id)).toBeDefined();
+		expect(fs.existsSync(stored.metadata.objectPath)).toBe(true);
+	});
+
+	it("prunes oldest non-live objects when the store exceeds the size budget", async () => {
+		const settings = mergeSettings(DEFAULT_CONTEXT_GUARD_SETTINGS, {
+			retention: { maxObjectAgeMs: Number.MAX_SAFE_INTEGER, maxTotalStoreBytes: 40 },
+		});
+		const store = new ContextGuardStore(tempDir, settings);
+		await store.initialize();
+		const first = await store.storeOutput({
+			sessionId: "session-one",
+			toolName: "bash",
+			text: "old output that should be pruned",
+			input: { command: "old" },
+			isError: false,
+			previewStrategy: "head-tail-middle-strip",
+		});
+		const second = await store.storeOutput({
+			sessionId: "session-one",
+			toolName: "bash",
+			text: "new output that should remain",
+			input: { command: "new" },
+			isError: false,
+			previewStrategy: "head-tail-middle-strip",
+		});
+
+		await store.applyRetention();
+
+		expect(store.getMetadata(first.metadata.id)).toBeUndefined();
+		expect(fs.existsSync(first.metadata.objectPath)).toBe(false);
+		expect(store.getMetadata(second.metadata.id)).toBeDefined();
+		expect(fs.existsSync(second.metadata.objectPath)).toBe(true);
+		const indexPath = path.join(tempDir, ".pi", "context-guard", "index", "session-one.jsonl");
+		const records = fs.readFileSync(indexPath, "utf-8").trim().split("\n");
+		expect(records).toHaveLength(1);
+		expect(records[0]).toContain(second.metadata.id);
+	});
+
 	it("migrates fallback session records to the real session key", async () => {
 		const store = new ContextGuardStore(tempDir, DEFAULT_CONTEXT_GUARD_SETTINGS);
 		await store.initialize();
@@ -330,6 +410,42 @@ describe("context-guard store", () => {
 		expect(store.getMetadata("bad")).toBeUndefined();
 	});
 
+	it("does not trust persisted object paths outside the context-guard object directory", async () => {
+		const indexDir = path.join(tempDir, ".pi", "context-guard", "index");
+		fs.mkdirSync(indexDir, { recursive: true });
+		const outsidePath = path.join(tempDir, "outside.txt");
+		fs.writeFileSync(outsidePath, "keep");
+		const id = "cg_malicious";
+		fs.writeFileSync(
+			path.join(indexDir, "session-one.jsonl"),
+			`${JSON.stringify({
+				recordType: "metadata",
+				id,
+				sessionKey: "session-one",
+				toolName: "bash",
+				byteCount: 1,
+				lineCount: 1,
+				createdTime: 1,
+				isError: false,
+				previewStrategy: "head",
+				objectPath: outsidePath,
+				relativeObjectPath: "outside.txt",
+				title: "malicious",
+				sketch: { malicious: 1 },
+			})}\n`,
+		);
+		const settings = mergeSettings(DEFAULT_CONTEXT_GUARD_SETTINGS, {
+			retention: { maxObjectAgeMs: 0, maxTotalStoreBytes: Number.MAX_SAFE_INTEGER },
+		});
+
+		const store = new ContextGuardStore(tempDir, settings);
+		await store.initialize();
+		await store.applyRetention({ now: 2 });
+
+		expect(store.getMetadata(id)?.objectPath).not.toBe(outsidePath);
+		expect(fs.existsSync(outsidePath)).toBe(true);
+	});
+
 	it("ranks records with prototype-key tokens safely", () => {
 		const records = [
 			{
@@ -350,6 +466,16 @@ describe("context-guard store", () => {
 		expect(getThresholdForTool("webSearch", DEFAULT_CONTEXT_GUARD_SETTINGS)).toBe(
 			DEFAULT_CONTEXT_GUARD_SETTINGS.thresholds.web,
 		);
+	});
+
+	it("keeps memory injection before request microcompact when merging settings", () => {
+		const settings = mergeSettings(DEFAULT_CONTEXT_GUARD_SETTINGS, {
+			memoryInjectionPercent: 90,
+			requestMicrocompactPercent: 70,
+		});
+
+		expect(settings.memoryInjectionPercent).toBeLessThan(settings.requestMicrocompactPercent);
+		expect(settings.requestMicrocompactPercent - settings.memoryInjectionPercent).toBeGreaterThanOrEqual(5);
 	});
 
 	it("builds previews without splitting utf-8 characters", () => {
