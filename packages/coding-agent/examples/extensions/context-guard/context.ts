@@ -17,7 +17,36 @@ export interface ContextTransformOptions {
 	usage: ContextUsage | undefined;
 }
 
+export interface ContextProjection {
+	messages: AgentMessage[];
+	changed: boolean;
+	initialTokens: number;
+	projectedTokens: number;
+	contextWindow: number;
+	targetTokens: number;
+	effectivePercent: number;
+	estimatedPercent: number;
+	shouldInjectMemory: boolean;
+	memoryInjected: boolean;
+	shouldFold: boolean;
+	foldedCount: number;
+	removedMemoryMarkers: number;
+}
+
+export interface ContextProjectionMode {
+	allocateMemoryMarker?: boolean;
+	includeMemory?: boolean;
+}
+
 export function transformContextMessages(options: ContextTransformOptions): AgentMessage[] | undefined {
+	const projection = projectContextMessages(options, { allocateMemoryMarker: true });
+	return projection.changed ? projection.messages : undefined;
+}
+
+export function projectContextMessages(
+	options: ContextTransformOptions,
+	mode: ContextProjectionMode = {},
+): ContextProjection {
 	const contextWindow = options.usage?.contextWindow ?? options.settings.defaultContextWindow;
 	const targetTokens = Math.max(1, Math.floor(contextWindow * options.settings.microcompactTargetRatio));
 	const initialEstimate = estimateMessagesTokens(options.messages);
@@ -27,14 +56,32 @@ export function transformContextMessages(options: ContextTransformOptions): Agen
 	const shouldInjectMemory = effectivePercent >= options.settings.memoryInjectionPercent;
 	const shouldFold =
 		effectivePercent >= options.settings.requestMicrocompactPercent || initialEstimate > targetTokens * 1.5;
+	const includeMemory = mode.includeMemory ?? true;
+	const allocateMemoryMarker = mode.allocateMemoryMarker ?? false;
+	const memoryMarkerCountBefore = countKnownMemoryMarkers(options.messages, options);
 
 	if (!shouldInjectMemory && !shouldFold && !containsKnownMemoryMarker(options.messages, options)) {
-		return undefined;
+		return {
+			messages: options.messages,
+			changed: false,
+			initialTokens: initialEstimate,
+			projectedTokens: initialEstimate,
+			contextWindow,
+			targetTokens,
+			effectivePercent,
+			estimatedPercent,
+			shouldInjectMemory,
+			memoryInjected: false,
+			shouldFold,
+			foldedCount: 0,
+			removedMemoryMarkers: 0,
+		};
 	}
 
 	let transformed = options.messages.map((message) => structuredClone(message));
 	transformed = removeKnownMemoryMarkers(transformed, options);
 	let changed = transformed.length !== options.messages.length;
+	let foldedCount = 0;
 
 	if (
 		shouldFold &&
@@ -48,14 +95,18 @@ export function transformContextMessages(options: ContextTransformOptions): Agen
 		);
 		transformed = folded.messages;
 		changed = changed || folded.changed;
+		foldedCount = folded.foldedCount;
 	}
 
-	if (shouldInjectMemory) {
+	let memoryInjected = false;
+	if (includeMemory && shouldInjectMemory) {
 		const memoryText = options.memory.renderRequestMemory(options.sessionKey, options.settings);
 		if (memoryText) {
 			const latestUserIndex = findLatestUserIndex(transformed);
 			if (latestUserIndex >= 0) {
-				const markerId = options.memory.nextMarkerId(options.sessionKey);
+				const markerId = allocateMemoryMarker
+					? options.memory.nextMarkerId(options.sessionKey)
+					: "__context_guard_dry_run__";
 				const memoryMessage: AgentMessage = {
 					role: "custom",
 					customType: "context_guard_memory",
@@ -66,11 +117,26 @@ export function transformContextMessages(options: ContextTransformOptions): Agen
 				};
 				transformed.splice(latestUserIndex, 0, memoryMessage);
 				changed = true;
+				memoryInjected = true;
 			}
 		}
 	}
 
-	return changed ? transformed : undefined;
+	return {
+		messages: changed ? transformed : options.messages,
+		changed,
+		initialTokens: initialEstimate,
+		projectedTokens: estimateMessagesTokens(changed ? transformed : options.messages),
+		contextWindow,
+		targetTokens,
+		effectivePercent,
+		estimatedPercent,
+		shouldInjectMemory,
+		memoryInjected,
+		shouldFold,
+		foldedCount,
+		removedMemoryMarkers: memoryMarkerCountBefore,
+	};
 }
 
 export function shouldLoadFoldReferencesForContext(
@@ -102,13 +168,14 @@ function foldToolResults(
 	targetTokens: number,
 	options: ContextTransformOptions,
 	forceFirstFold: boolean,
-): { messages: AgentMessage[]; changed: boolean } {
+): { messages: AgentMessage[]; changed: boolean; foldedCount: number } {
 	let currentEstimate = estimateMessagesTokens(messages);
-	if (currentEstimate <= targetTokens && !forceFirstFold) return { messages, changed: false };
+	if (currentEstimate <= targetTokens && !forceFirstFold) return { messages, changed: false, foldedCount: 0 };
 
 	const protectedStart = Math.max(0, messages.length - options.settings.microcompactRecentMessages);
 	const candidates = collectFoldCandidates(messages, protectedStart);
 	let changed = false;
+	let foldedCount = 0;
 
 	for (const candidate of candidates) {
 		if (currentEstimate <= targetTokens && !forceFirstFold) break;
@@ -124,10 +191,11 @@ function foldToolResults(
 		message.llmContent = nextContent;
 		currentEstimate = estimateMessagesTokens(messages);
 		changed = true;
+		foldedCount += 1;
 		forceFirstFold = false;
 	}
 
-	return { messages, changed };
+	return { messages, changed, foldedCount };
 }
 
 interface FoldCandidate {
@@ -224,6 +292,10 @@ function containsKnownMemoryMarker(messages: AgentMessage[], options: ContextTra
 	return messages.some((message) => removeKnownMemoryMarkerFromMessage(message, options) === undefined);
 }
 
+function countKnownMemoryMarkers(messages: AgentMessage[], options: ContextTransformOptions): number {
+	return messages.filter((message) => removeKnownMemoryMarkerFromMessage(message, options) === undefined).length;
+}
+
 function extractMarkerId(content: string | ToolContent[]): string | undefined {
 	const text = typeof content === "string" ? content : contentText(content);
 	const match = text.match(/^<context_guard_memory id="([A-Za-z0-9_-]+)">[\s\S]*<\/context_guard_memory>$/);
@@ -237,7 +309,7 @@ function findLatestUserIndex(messages: AgentMessage[]): number {
 	return -1;
 }
 
-function estimateMessagesTokens(messages: AgentMessage[]): number {
+export function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let bytes = 0;
 	for (const message of messages) {
 		switch (message.role) {

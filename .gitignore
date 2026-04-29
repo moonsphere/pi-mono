@@ -37,4 +37,7 @@ todo.md
 plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
+.pi/context-guard/index/
+.pi/context-guard/objects/
+.pi/context-guard/replacements.jsonl
 collect.sh

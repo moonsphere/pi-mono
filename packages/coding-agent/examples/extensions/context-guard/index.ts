@@ -1,5 +1,11 @@
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { ContextUsage, ExtensionAPI, ExtensionContext, ToolCallEvent } from "@mariozechner/pi-coding-agent";
+import type {
+	ContextUsage,
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ToolCallEvent,
+} from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { extractContextGuardId, shouldLoadFoldReferencesForContext, transformContextMessages } from "./context.js";
@@ -24,9 +30,12 @@ import {
 	type FoldReferenceLookup,
 	loadFoldReferences,
 	mergeContextGuardDetails,
+	type StoreStats,
 	sanitizeSessionKey,
 } from "./store.js";
 import { countBytes, countLines, createPreview } from "./truncate.js";
+import { buildContextUsageReport } from "./usage.js";
+import { renderContextUsageReport } from "./usage-render.js";
 
 type ToolContent = TextContent | ImageContent;
 
@@ -299,6 +308,62 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			const store = await getStore(ctx.cwd, settings, storesByCwd);
 			ctx.ui.notify(renderStats(store.getStats()), "info");
 		},
+	});
+
+	const showContextUsage = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+		const settings = await getSettings(ctx.cwd, settingsByCwd);
+		const sessionKey = getSessionKey(ctx);
+		const usage = ctx.getContextUsage();
+		if (usage?.percent !== null && usage?.percent !== undefined) {
+			latestContextUsage.set(sessionKey, usage);
+		}
+		await preloadFoldReferences(ctx.cwd, settings, foldReferencesByCwd);
+
+		let replacements: FoldReferenceLookup = await getFoldReferenceLookup(
+			ctx.cwd,
+			storesByCwd,
+			foldReferencesByCwd,
+			true,
+		);
+		let storeStats: StoreStats | undefined;
+		try {
+			const store = await getStore(ctx.cwd, settings, storesByCwd);
+			storeStats = store.getStats();
+			replacements = store;
+		} catch {
+			storeStats = undefined;
+		}
+
+		const report = buildContextUsageReport({
+			ctx,
+			sessionKey,
+			settings,
+			replacements,
+			memory,
+			storeStats,
+			liveIds: getLiveContextGuardIds(ctx, memory, sessionKey),
+			tools: pi.getAllTools(),
+			activeToolNames: pi.getActiveTools(),
+			commands: pi.getCommands(),
+			thinkingLevel: pi.getThinkingLevel(),
+			usage,
+		});
+		ctx.ui.notify(
+			renderContextUsageReport(report, {
+				verbose: args.split(/\s+/).includes("--verbose") || args.split(/\s+/).includes("-v"),
+			}),
+			report.model.known ? "info" : "warning",
+		);
+	};
+
+	pi.registerCommand("context", {
+		description: "Show current context usage",
+		handler: showContextUsage,
+	});
+
+	pi.registerCommand("context-guard:context", {
+		description: "Show current context usage with context-guard details",
+		handler: showContextUsage,
 	});
 
 	pi.registerCommand("context-guard:purge", {

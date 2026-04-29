@@ -49,6 +49,8 @@ Smaller aggregate windows are more sensitive to output floods. Larger windows ar
 
 - `context_open({ id, startLine, maxLines })`: open a bounded slice of an externalized output.
 - `context_search({ query, toolName, limit })`: search stored output sketches and return bounded snippets.
+- `/context`: show current context usage, estimated category breakdown, context-guard storage, and command/tool inventory.
+- `/context-guard:context`: same report as `/context`; add `--verbose` for tool and command details.
 - `/context-guard:open <id>`: open an externalized output from the CLI.
 - `/context-guard:stats`: show object counts, bytes, and per-tool totals.
 - `/context-guard:purge --force`: remove current project context-guard data. Without `--force`, purge refuses active sessions with live externalized ids.

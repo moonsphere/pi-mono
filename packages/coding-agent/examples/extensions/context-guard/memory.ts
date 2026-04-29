@@ -125,11 +125,11 @@ export class ContextGuardMemory {
 	}
 
 	isKnownMarkerId(sessionKey: string, id: string): boolean {
-		return this.getState(sessionKey).knownMarkerIds.has(id);
+		return this.sessions.get(sessionKey)?.knownMarkerIds.has(id) ?? false;
 	}
 
 	getLiveExternalizedIds(sessionKey: string): Set<string> {
-		return new Set(this.getState(sessionKey).externalizedIds);
+		return new Set(this.sessions.get(sessionKey)?.externalizedIds ?? []);
 	}
 
 	getAllLiveExternalizedIds(): Set<string> {
