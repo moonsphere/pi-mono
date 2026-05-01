@@ -31,6 +31,8 @@ export interface ContextGuardSettings {
 	contextOpenMaxLines: number;
 	contextSearchDefaultLimit: number;
 	contextSearchMaxLimit: number;
+	contextListDefaultLimit: number;
+	contextListMaxLimit: number;
 	sketchHeadBytes: number;
 	sketchTailBytes: number;
 	sketchMaxTokens: number;
@@ -85,6 +87,8 @@ export const DEFAULT_CONTEXT_GUARD_SETTINGS: ContextGuardSettings = {
 	contextOpenMaxLines: 1000,
 	contextSearchDefaultLimit: 5,
 	contextSearchMaxLimit: 20,
+	contextListDefaultLimit: 20,
+	contextListMaxLimit: 100,
 	sketchHeadBytes: 1 * MB,
 	sketchTailBytes: 1 * MB,
 	sketchMaxTokens: 500,
@@ -254,6 +258,8 @@ const positiveNumberKeys = [
 	"contextOpenMaxLines",
 	"contextSearchDefaultLimit",
 	"contextSearchMaxLimit",
+	"contextListDefaultLimit",
+	"contextListMaxLimit",
 	"sketchHeadBytes",
 	"sketchTailBytes",
 	"sketchMaxTokens",

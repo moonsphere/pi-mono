@@ -23,9 +23,11 @@ The extension is automatic for final `tool_result` messages. Streaming `tool_exe
 - preview cap: 12KB
 - request memory injection: 70% context usage
 - request-only microcompact: 80% context usage
+- recent output list: 20 entries by default, capped at 100
 
 Request microcompact uses persisted fold-reference text from `replacements.jsonl` and does not mutate the stored session history.
 If config overrides put memory injection at or after request microcompact, the extension normalizes the pair so memory injection still happens first with at least a five percentage point gap.
+The extension also publishes a compact footer status with object count, stored bytes, live id count, and known context usage.
 
 ## Configuration
 
@@ -51,7 +53,9 @@ Smaller aggregate windows are more sensitive to output floods. Larger windows ar
 - `context_search({ query, toolName, limit })`: search stored output sketches and return bounded snippets.
 - `/context`: show current context usage, estimated category breakdown, context-guard storage, and command/tool inventory.
 - `/context-guard:context`: same report as `/context`; add `--verbose` for tool and command details.
+- `/context-guard:list [--limit n] [--tool name]`: list recent externalized outputs with `context_open` recovery commands.
 - `/context-guard:open <id>`: open an externalized output from the CLI.
+- `/context-guard:settings`: show the effective sanitized context-guard configuration.
 - `/context-guard:stats`: show object counts, bytes, and per-tool totals.
 - `/context-guard:purge --force`: remove current project context-guard data. Without `--force`, purge refuses active sessions with live externalized ids.
 

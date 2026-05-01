@@ -160,6 +160,32 @@ describe("context-guard store", () => {
 		}
 	});
 
+	it("lists recent outputs newest first and filters by tool name", async () => {
+		const store = new ContextGuardStore(tempDir, DEFAULT_CONTEXT_GUARD_SETTINGS);
+		await store.initialize();
+		const first = await store.storeOutput({
+			sessionId: "session-one",
+			toolName: "bash",
+			text: "first output",
+			input: { command: "first-command" },
+			isError: false,
+			previewStrategy: "head-tail-middle-strip",
+		});
+		const second = await store.storeOutput({
+			sessionId: "session-one",
+			toolName: "read",
+			text: "second output",
+			input: { path: "second.txt" },
+			isError: false,
+			previewStrategy: "head",
+		});
+
+		expect(store.listOutputs({ limit: 1 }).map((metadata) => metadata.id)).toEqual([second.metadata.id]);
+		expect(store.listOutputs({ limit: 10, toolName: "bash" }).map((metadata) => metadata.id)).toEqual([
+			first.metadata.id,
+		]);
+	});
+
 	it("removes object files when metadata persistence fails after object write", async () => {
 		const store = new ContextGuardStore(tempDir, DEFAULT_CONTEXT_GUARD_SETTINGS);
 		await store.initialize();

@@ -284,6 +284,15 @@ export class ContextGuardStore {
 		};
 	}
 
+	listOutputs(options: { limit: number; toolName?: string }): ContextGuardMetadata[] {
+		const limit = Math.max(0, Math.floor(options.limit));
+		const toolName = options.toolName?.toLowerCase();
+		return Array.from(this.metadataById.values())
+			.filter((metadata) => !toolName || metadata.toolName.toLowerCase() === toolName)
+			.sort((a, b) => b.createdTime - a.createdTime || a.id.localeCompare(b.id))
+			.slice(0, limit);
+	}
+
 	async purge(): Promise<void> {
 		await this.drain();
 		await rm(this.storeDir, { recursive: true, force: true });

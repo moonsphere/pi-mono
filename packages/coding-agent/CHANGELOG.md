@@ -5,6 +5,7 @@
 ### Added
 
 - Added `websocket-cached` to the transport setting options for the OpenAI Codex provider used with ChatGPT subscription auth. This keeps the same WebSocket open for a session and, after the first request, sends only the new conversation items instead of resending the full chat history when possible.
+- Added context-guard status, recent output listing, and effective settings commands to the example extension.
 
 ## [0.71.0] - 2026-04-30
 

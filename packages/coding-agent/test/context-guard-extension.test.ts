@@ -355,7 +355,7 @@ describe("context-guard extension", () => {
 	});
 
 	it("injects bounded request memory before the latest user message and replaces prior generated markers", async () => {
-		await runner.emit({ type: "message_end", message: userMessage("Remember the active task") });
+		await runner.emitMessageEnd({ type: "message_end", message: userMessage("Remember the active task") });
 		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
 		const messages = [userMessage("latest prompt")];
 
@@ -375,7 +375,7 @@ describe("context-guard extension", () => {
 	});
 
 	it("skips request memory injection when no latest user message exists", async () => {
-		await runner.emit({ type: "message_end", message: userMessage("Remember the active task") });
+		await runner.emitMessageEnd({ type: "message_end", message: userMessage("Remember the active task") });
 		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
 
 		const transformed = await runner.emitContext([
@@ -416,7 +416,7 @@ describe("context-guard extension", () => {
 	});
 
 	it("builds custom compaction summaries from structured memory", async () => {
-		await runner.emit({ type: "message_end", message: userMessage("Fix context guard compaction") });
+		await runner.emitMessageEnd({ type: "message_end", message: userMessage("Fix context guard compaction") });
 		await emitTextResult("read", "small file", { path: "src/context.ts" });
 		await emitTextResult("bash", "command failed", { command: "npm run check" }, {}, true);
 		const externalized = await emitTextResult("bash", "x".repeat(60 * 1024), { command: "long-output" });
@@ -449,7 +449,7 @@ describe("context-guard extension", () => {
 	});
 
 	it("does not replace core compaction when Pi has messages to summarize", async () => {
-		await runner.emit({ type: "message_end", message: userMessage("Keep default compaction") });
+		await runner.emitMessageEnd({ type: "message_end", message: userMessage("Keep default compaction") });
 
 		const result = await runner.emit({
 			type: "session_before_compact",
@@ -573,7 +573,7 @@ describe("context-guard extension", () => {
 
 	it("keeps system metadata from evicting user memory events", async () => {
 		writeContextGuardConfig({ memoryEventLimit: 1 });
-		await runner.emit({ type: "message_end", message: userMessage("Keep this goal") });
+		await runner.emitMessageEnd({ type: "message_end", message: userMessage("Keep this goal") });
 		await runner.emitBeforeAgentStart("ignored", undefined, "system prompt one", { cwd: tempDir });
 		await runner.emitBeforeAgentStart("ignored", undefined, "system prompt two", { cwd: tempDir });
 
@@ -709,6 +709,55 @@ describe("context-guard extension", () => {
 		expect(notifications.at(-1)?.message).toBe("context-guard store purged");
 	});
 
+	it("updates footer status with storage and context usage", async () => {
+		const statuses = bindStatus();
+		contextUsage = { tokens: 7500, contextWindow: 10_000, percent: 75 };
+		await runner.emitContext([userMessage("prime status usage")]);
+
+		await emitTextResult("bash", "x".repeat(60 * 1024), { command: "status-command" });
+
+		expect(statuses.at(-1)).toMatchObject({ key: "context-guard" });
+		expect(statuses.at(-1)?.text).toContain("guard: 1 obj");
+		expect(statuses.at(-1)?.text).toContain("60 KB");
+		expect(statuses.at(-1)?.text).toContain("live 1");
+		expect(statuses.at(-1)?.text).toContain("ctx 75%");
+	});
+
+	it("lists recent externalized outputs from a command", async () => {
+		const notifications = bindNotifications();
+		await emitTextResult("bash", "old command output\n".repeat(2500), { command: "old-command-token" });
+		await emitTextResult("read", "recent file output\n".repeat(2500), { path: "recent-file-token.txt" });
+
+		await getCommand("context-guard:list").handler("--limit 1", runner.createCommandContext());
+		const latestList = notifications.at(-1)?.message ?? "";
+
+		expect(latestList).toContain("[context-guard] Recent externalized outputs");
+		expect(latestList).toContain("read path: recent-file-token.txt");
+		expect(latestList).not.toContain("old-command-token");
+
+		await getCommand("context-guard:list").handler("--tool bash --limit 10", runner.createCommandContext());
+		const bashList = notifications.at(-1)?.message ?? "";
+
+		expect(bashList).toContain("bash command: old-command-token");
+		expect(bashList).not.toContain("recent-file-token.txt");
+	});
+
+	it("reports effective settings from a command", async () => {
+		const notifications = bindNotifications();
+		writeContextGuardConfig({
+			contextListDefaultLimit: 7,
+			thresholds: { bash: { maxBytes: 10 } },
+		});
+
+		await getCommand("context-guard:settings").handler("", runner.createCommandContext());
+		const message = notifications.at(-1)?.message ?? "";
+
+		expect(message).toContain("context-guard settings");
+		expect(message).toContain("storeDir: .pi/context-guard");
+		expect(message).toContain("context-guard:list: default 7");
+		expect(message).toContain("- bash: 10 B or 2000 lines");
+	});
+
 	it("preserves original tool result when store initialization fails and retries later", async () => {
 		const notifications = bindNotifications();
 		const piPath = path.join(tempDir, ".pi");
@@ -731,7 +780,13 @@ describe("context-guard extension", () => {
 		const commands = runner.getRegisteredCommands().map((command) => command.name);
 
 		expect(commands).toEqual(
-			expect.arrayContaining(["context-guard:open", "context-guard:purge", "context-guard:stats"]),
+			expect.arrayContaining([
+				"context-guard:list",
+				"context-guard:open",
+				"context-guard:purge",
+				"context-guard:settings",
+				"context-guard:stats",
+			]),
 		);
 	});
 
@@ -774,6 +829,17 @@ describe("context-guard extension", () => {
 			}),
 		});
 		return notifications;
+	}
+
+	function bindStatus(): Array<{ key: string; text: string | undefined }> {
+		const statuses: Array<{ key: string; text: string | undefined }> = [];
+		runner.setUIContext({
+			...runner.getUIContext(),
+			setStatus: vi.fn((key: string, text: string | undefined) => {
+				statuses.push({ key, text });
+			}),
+		});
+		return statuses;
 	}
 
 	function writeContextGuardConfig(config: Record<string, unknown>): void {

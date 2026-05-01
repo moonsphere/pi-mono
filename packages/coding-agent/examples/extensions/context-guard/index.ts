@@ -12,9 +12,12 @@ import { extractContextGuardId, shouldLoadFoldReferencesForContext, transformCon
 import { ContextGuardMemory } from "./memory.js";
 import {
 	createFoldReference,
+	renderContextGuardStatus,
 	renderExternalizedPreview,
 	renderOpenResult,
+	renderOutputList,
 	renderSearchResults,
+	renderSettings,
 	renderStats,
 } from "./render.js";
 import {
@@ -40,6 +43,7 @@ import { renderContextUsageReport } from "./usage-render.js";
 type ToolContent = TextContent | ImageContent;
 
 const RETENTION_INTERVAL_MS = 5 * 60 * 1000;
+const CONTEXT_GUARD_STATUS_KEY = "context-guard";
 
 interface TextExtraction {
 	text: string;
@@ -95,6 +99,7 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			await store.migrateSessionKey(fallbackSessionKey, sessionKey);
 			await store.applyRetention({ liveIds: getLiveContextGuardIds(ctx, memory, sessionKey) }).catch(() => {});
 		}
+		await updateContextGuardStatus(ctx, storesByCwd, memory, sessionKey).catch(() => {});
 	});
 
 	pi.on("session_compact", async (event, ctx) => {
@@ -103,6 +108,7 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 		memory.recordCompaction(sessionKey, event, settings);
 		aggregateWindows.delete(sessionKey);
 		latestContextUsage.delete(sessionKey);
+		await updateContextGuardStatus(ctx, storesByCwd, memory, sessionKey).catch(() => {});
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -117,6 +123,7 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			aggregateWindows.delete(sessionKey);
 			latestContextUsage.delete(sessionKey);
 			memory.reset(sessionKey);
+			ctx.ui.setStatus(CONTEXT_GUARD_STATUS_KEY, undefined);
 		}
 	});
 
@@ -171,6 +178,7 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			memory,
 			usage,
 		});
+		await updateContextGuardStatus(ctx, storesByCwd, memory, sessionKey, usage).catch(() => {});
 		return messages ? { messages } : undefined;
 	});
 
@@ -214,6 +222,9 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			foldReferencesByCwd.delete(ctx.cwd);
 			memory.recordToolResult(sessionKey, event, settings, stored.metadata);
 			await maybeApplyRetention(ctx, store, memory, sessionKey, lastRetentionByCwd).catch(() => {});
+			await updateContextGuardStatus(ctx, storesByCwd, memory, sessionKey, latestContextUsage.get(sessionKey)).catch(
+				() => {},
+			);
 			const previewText = renderExternalizedPreview(stored.metadata, preview, settings.contextOpenDefaultMaxLines);
 
 			return {
@@ -310,6 +321,28 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("context-guard:list", {
+		description: "List recent externalized context-guard outputs",
+		handler: async (args, ctx) => {
+			const settings = await getSettings(ctx.cwd, settingsByCwd);
+			const store = await getStore(ctx.cwd, settings, storesByCwd);
+			const options = parseListArgs(args, settings);
+			const outputs = store.listOutputs(options);
+			ctx.ui.notify(
+				renderOutputList(outputs, settings.contextOpenDefaultMaxLines),
+				outputs.length > 0 ? "info" : "warning",
+			);
+		},
+	});
+
+	pi.registerCommand("context-guard:settings", {
+		description: "Show effective context-guard settings",
+		handler: async (_args, ctx) => {
+			const settings = await getSettings(ctx.cwd, settingsByCwd);
+			ctx.ui.notify(renderSettings(settings), "info");
+		},
+	});
+
 	const showContextUsage = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
 		const settings = await getSettings(ctx.cwd, settingsByCwd);
 		const sessionKey = getSessionKey(ctx);
@@ -382,6 +415,7 @@ export default function contextGuardExtension(pi: ExtensionAPI) {
 			latestContextUsage.delete(sessionKey);
 			lastRetentionByCwd.delete(ctx.cwd);
 			memory.reset(sessionKey);
+			await updateContextGuardStatus(ctx, storesByCwd, memory, sessionKey).catch(() => {});
 			ctx.ui.notify("context-guard store purged", "info");
 		},
 	});
@@ -428,6 +462,30 @@ async function getStore(
 		storesByCwd.set(cwd, storePromise);
 	}
 	return storePromise;
+}
+
+async function updateContextGuardStatus(
+	ctx: ExtensionContext,
+	storesByCwd: Map<string, Promise<ContextGuardStore>>,
+	memory: ContextGuardMemory,
+	sessionKey: string,
+	usage?: ContextUsage,
+): Promise<void> {
+	const stats = await getExistingStoreStats(ctx.cwd, storesByCwd);
+	ctx.ui.setStatus(
+		CONTEXT_GUARD_STATUS_KEY,
+		renderContextGuardStatus(stats, getLiveContextGuardIds(ctx, memory, sessionKey), usage),
+	);
+}
+
+async function getExistingStoreStats(
+	cwd: string,
+	storesByCwd: Map<string, Promise<ContextGuardStore>>,
+): Promise<StoreStats | undefined> {
+	const storePromise = storesByCwd.get(cwd);
+	if (!storePromise) return undefined;
+	const store = await storePromise.catch(() => undefined);
+	return store?.getStats();
 }
 
 async function getFoldReferenceLookup(
@@ -616,6 +674,40 @@ function getFallbackSessionKey(): string {
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
 	const candidate = typeof value === "number" && Number.isFinite(value) ? value : fallback;
 	return Math.min(Math.max(Math.floor(candidate), min), max);
+}
+
+function parseListArgs(args: string, settings: ContextGuardSettings): { limit: number; toolName?: string } {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	let limit: number | undefined;
+	let toolName: string | undefined;
+	for (let index = 0; index < parts.length; index++) {
+		const part = parts[index];
+		if (part === "--limit" || part === "-n") {
+			limit = Number(parts[index + 1]);
+			index++;
+			continue;
+		}
+		if (part.startsWith("--limit=")) {
+			limit = Number(part.slice("--limit=".length));
+			continue;
+		}
+		if (part === "--tool") {
+			toolName = parts[index + 1];
+			index++;
+			continue;
+		}
+		if (part.startsWith("--tool=")) {
+			toolName = part.slice("--tool=".length);
+			continue;
+		}
+		if (!part.startsWith("-") && !toolName) {
+			toolName = part;
+		}
+	}
+	return {
+		limit: clampNumber(limit, settings.contextListDefaultLimit, 1, settings.contextListMaxLimit),
+		toolName,
+	};
 }
 
 function getLiveContextGuardIds(ctx: ExtensionContext, memory: ContextGuardMemory, sessionKey: string): Set<string> {

@@ -1,5 +1,10 @@
+import type { ContextGuardSettings } from "./settings.js";
 import type { ContextGuardMetadata, OpenResult, SearchResult, StoreStats } from "./store.js";
 import { formatBytes, type PreviewResult } from "./truncate.js";
+
+export interface ContextGuardStatusUsage {
+	percent?: number | null;
+}
 
 export function renderExternalizedPreview(
 	metadata: ContextGuardMetadata,
@@ -62,4 +67,66 @@ export function renderStats(stats: StoreStats): string {
 		}
 	}
 	return lines.join("\n");
+}
+
+export function renderOutputList(outputs: ContextGuardMetadata[], maxLines: number): string {
+	if (outputs.length === 0) return "[context-guard] No externalized outputs.";
+	const lines = ["[context-guard] Recent externalized outputs"];
+	for (const [index, metadata] of outputs.entries()) {
+		lines.push(
+			`${index + 1}. ${metadata.id} ${metadata.title} (${formatBytes(metadata.byteCount)}, ${metadata.lineCount} lines)`,
+		);
+		lines.push(`   context_open({ id: "${metadata.id}", startLine: 1, maxLines: ${maxLines} })`);
+	}
+	return lines.join("\n");
+}
+
+export function renderContextGuardStatus(
+	stats: StoreStats | undefined,
+	liveIds: Set<string>,
+	usage?: ContextGuardStatusUsage,
+): string {
+	const objectCount = stats?.objectCount ?? 0;
+	const parts = [`guard: ${objectCount} ${objectCount === 1 ? "obj" : "objs"}`];
+	if (stats) parts.push(formatBytes(stats.totalBytes));
+	if (liveIds.size > 0) parts.push(`live ${liveIds.size}`);
+	if (usage?.percent !== null && usage?.percent !== undefined) parts.push(`ctx ${formatPercent(usage.percent)}`);
+	if (stats?.replacementDegraded) parts.push("refs degraded");
+	return parts.join(", ");
+}
+
+export function renderSettings(settings: ContextGuardSettings): string {
+	const lines = [
+		"context-guard settings",
+		`storeDir: ${settings.storeDir}`,
+		`preview: ${formatBytes(settings.previewMaxBytes)} or ${settings.previewMaxLines} lines`,
+		`aggregate: ${formatBytes(settings.aggregateMaxBytes)} across ${settings.aggregateWindowSize} results`,
+		`memory injection: ${formatPercent(settings.memoryInjectionPercent)}`,
+		`request microcompact: ${formatPercent(settings.requestMicrocompactPercent)} to ${formatPercent(settings.microcompactTargetRatio * 100)} target`,
+		`context_open: default ${settings.contextOpenDefaultMaxLines} lines, max ${settings.contextOpenMaxLines}`,
+		`context_search: default ${settings.contextSearchDefaultLimit}, max ${settings.contextSearchMaxLimit}`,
+		`context-guard:list: default ${settings.contextListDefaultLimit}, max ${settings.contextListMaxLimit}`,
+		`retention: ${formatDuration(settings.retention.maxObjectAgeMs)} or ${formatBytes(settings.retention.maxTotalStoreBytes)}`,
+		"thresholds:",
+	];
+	for (const name of ["bash", "read", "grep", "find", "web", "fallback"] as const) {
+		const threshold = settings.thresholds[name];
+		lines.push(
+			`- ${name}: ${formatBytes(threshold.maxBytes)} or ${threshold.maxLines} lines, preview ${threshold.previewStrategy}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+function formatPercent(value: number): string {
+	return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+function formatDuration(ms: number): string {
+	if (!Number.isFinite(ms)) return "unlimited";
+	const dayMs = 24 * 60 * 60 * 1000;
+	if (ms >= dayMs && ms % dayMs === 0) return `${Math.round(ms / dayMs)}d`;
+	const hourMs = 60 * 60 * 1000;
+	if (ms >= hourMs && ms % hourMs === 0) return `${Math.round(ms / hourMs)}h`;
+	return `${Math.round(ms)}ms`;
 }
